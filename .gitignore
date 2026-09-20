@@ -1,0 +1,8 @@
+bank/
+private/
+synthetic/
+results/raw/
+runs/
+__pycache__/
+*.pyc
+.DS_Store
