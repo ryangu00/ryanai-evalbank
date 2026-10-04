@@ -66,20 +66,26 @@ def run_task(task_dir, base, model, thinking, max_turns=30, timeout=600, log=Non
     """task_dir has: task.md, seed/ (repo), hidden/ (test_*.py). Returns dict(score, turns, tool_calls, ...)."""
     root = tempfile.mkdtemp(prefix="evalbank-c9-"); shutil.copytree(os.path.join(task_dir, "seed"), root, dirs_exist_ok=True)
     task = open(os.path.join(task_dir, "task.md")).read()
-    msgs = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": task}]
+    msgs = [{"role": "system", "content": os.environ.get("EVALBANK_SYSTEM", SYSTEM)}, {"role": "user", "content": task}]
     t0 = time.time(); turns = 0; calls = 0; tok = 0; raws = []; finished = False; err = None
     try:
         while turns < max_turns and time.time() - t0 < timeout:
-            body = {"model": model, "messages": msgs, "tools": TOOLS, "tool_choice": "auto", "max_tokens": int(os.environ.get("EVALBANK_MAX_TOKENS", "8000")),
-                    "temperature": 0.5 if thinking else 0.0, "top_p": 0.95,
-                    "chat_template_kwargs": {"thinking": thinking, **({"reasoning_effort": "high"} if thinking else {})}}
-            req = urllib.request.Request(f"{base}/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"})
+            sampling = json.loads(os.environ["EVALBANK_SAMPLING"]) if "EVALBANK_SAMPLING" in os.environ else {"temperature": 0.5 if thinking else 0.0, "top_p": 0.95}
+            kwargs = json.loads(os.environ["EVALBANK_CHAT_KWARGS"]) if "EVALBANK_CHAT_KWARGS" in os.environ else {"thinking": thinking, **({"reasoning_effort": "high"} if thinking else {})}
+            body = {**sampling, "model": model, "messages": msgs, "tools": TOOLS, "tool_choice": "auto", "max_tokens": int(os.environ.get("EVALBANK_MAX_TOKENS", "8000")),
+                    "chat_template_kwargs": kwargs}
+            headers = {"Content-Type": "application/json"}
+            if os.environ.get("EVALBANK_API_KEY"): headers["Authorization"] = f"Bearer {os.environ['EVALBANK_API_KEY']}"
+            req = urllib.request.Request(f"{base}/chat/completions", json.dumps(body).encode(), headers)
             with urllib.request.urlopen(req, timeout=max(30, timeout - (time.time() - t0))) as r:
                 raw = r.read().decode()
             raws.append(raw); d = json.loads(raw); turns += 1
             tok += (d.get("usage") or {}).get("completion_tokens", 0)
             m = d["choices"][0]["message"]; tcs = m.get("tool_calls") or []
-            msgs.append({"role": "assistant", "content": m.get("content") or "", **({"tool_calls": tcs} if tcs else {})})
+            previous = {"role": "assistant", "content": m.get("content") or "", **({"tool_calls": tcs} if tcs else {})}
+            if os.environ.get("EVALBANK_PRESERVE_REASONING") == "1" and m.get("reasoning_content"):
+                previous["reasoning_content"] = m["reasoning_content"]
+            msgs.append(previous)
             if not tcs:
                 msgs.append({"role": "user", "content": "Continue: use tools to modify and verify, then call done when finished."}); continue
             for tc in tcs:
@@ -108,7 +114,7 @@ def run_task(task_dir, base, model, thinking, max_turns=30, timeout=600, log=Non
 
 if __name__ == "__main__":
     import argparse
-    ap = argparse.ArgumentParser(); ap.add_argument("task_dir"); ap.add_argument("--base-url", default="http://127.0.0.1:8000/v1")
+    ap = argparse.ArgumentParser(); ap.add_argument("task_dir"); ap.add_argument("--base-url", required=True)
     ap.add_argument("--model", required=True); ap.add_argument("--thinking", default="off")
     a = ap.parse_args()
     r = run_task(a.task_dir, a.base_url, a.model, a.thinking == "on", log=sys.stderr)

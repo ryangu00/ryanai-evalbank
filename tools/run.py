@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """evalbank runner — one command, several categories, N runs, median+spread, raw bodies kept.
 
-  run.py --base-url http://127.0.0.1:8000/v1 --model <served> --label run1 [--tier private]
+  run.py --base-url <endpoint-base-url> --model <served> --label run1 [--tier private]
          [--cats c1-kbqa,c2-longctx,...] [--runs 2] [--thinking on|off] [--parallel 4] [--judge <model>]
-         [--judge-base-url http://127.0.0.1:8000/v1]
+         [--judge-base-url <judge-base-url>]
 
 Private tier: base_url host must be on the allowlist AND resolve to loopback/RFC1918.
 Outputs runs/<ts>-<label>/{results.json,report.md,raw/<cat>-run<k>.jsonl}. The tool-use categories shell
 out to tool-eval-bench (--scenario-pack --pack-only); their 0/1/2 scores are reported in a separate column,
 never merged with the own-bank 0/1 scores.
 """
-import argparse, concurrent.futures as cf, hashlib, ipaddress, json, os, re, socket, statistics, subprocess, sys, tempfile, time, urllib.request
+import argparse, concurrent.futures as cf, hashlib, ipaddress, json, math, os, platform, re, socket, statistics, subprocess, sys, tempfile, time, urllib.request
 
 ROOT = os.environ.get("EVALBANK_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-ALLOW_HOSTS = {"127.0.0.1", "localhost", *filter(None, os.environ.get("EVALBANK_ALLOW_HOSTS", "").split(","))}  # private tier: add your LAN node IPs via env
+ALLOW_HOSTS = set(filter(None, os.environ.get("EVALBANK_ALLOW_HOSTS", "").split(",")))  # private tier: explicitly configure allowed hosts
 OWN_CATS = ["c1-kbqa", "c2-longctx", "c4-code", "c5-extract", "c6-vision", "c7-zhif", "c9-long-coding", "c10-sre-ops"]
 PACK_CATS = ["c3-tool", "c7-agentic-if", "c8-judgment"]
 ALL_CATS = ["c1-kbqa", "c2-longctx", "c3-tool", "c4-code", "c5-extract", "c6-vision", "c7-zhif", "c7-agentic-if", "c8-judgment", "c9-long-coding", "c10-sre-ops"]
@@ -56,15 +56,108 @@ def load_items(tier, cat):
 
 # ---------- model call ----------
 MAX_TOKENS = int(os.environ.get("EVALBANK_MAX_TOKENS", "8000"))  # the thinking-mode comparison in docs/worked-example.md used 16384
+CONFIG = {}
+
+
+def load_recipe(model):
+    directory = os.path.realpath(f"{ROOT}/recipes")
+    path = os.path.realpath(os.path.join(directory, model + ".json"))
+    if not path.startswith(directory + os.sep): raise SystemExit("recipe path escapes recipes/")
+    if not os.path.isfile(path): raise SystemExit(f"missing recipe: recipes/{model}.json; use --recipe-arm harness-uniform --reason '<why>' for a control")
+    try:
+        with open(path) as f: recipe = json.load(f)
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"cannot read recipe: {e}")
+    if not isinstance(recipe, dict): raise SystemExit("recipe must be an object")
+    sampling = recipe.get("sampling")
+    if not isinstance(sampling, dict) or any(k not in sampling for k in ("temperature", "top_p")):
+        raise SystemExit("recipe sampling requires temperature and top_p")
+    if not isinstance(recipe.get("limitations"), list): raise SystemExit("recipe requires an explicit limitations list")
+    return recipe
+
+
+def resolve_config(a):
+    """Resolve before creating run artifacts; source labels are declarations, not verification."""
+    uniform = a.recipe_arm == "harness-uniform"
+    reason = (a.reason or "").strip()
+    if uniform and not reason: raise SystemExit("harness-uniform requires a non-empty --reason")
+    recipe = None if uniform else load_recipe(a.model)
+    sampling = dict(recipe["sampling"]) if recipe is not None else {"temperature": 0.5 if a.thinking == "on" else 0.0, "top_p": 0.95}
+    chat_kwargs = recipe.get("chat_kwargs", {}) if recipe is not None else {"thinking": a.thinking == "on", **({"reasoning_effort": "high"} if a.thinking == "on" else {})}
+    if not isinstance(chat_kwargs, dict): raise SystemExit("recipe chat_kwargs must be an object")
+    chat_kwargs = dict(chat_kwargs)
+    max_tokens = recipe.get("max_tokens", MAX_TOKENS) if recipe is not None else MAX_TOKENS
+    system = recipe.get("system") if recipe is not None else None
+    preserve = recipe.get("preserve_reasoning", False) if recipe is not None else False
+    if not isinstance(preserve, bool): raise SystemExit("preserve_reasoning must be boolean")
+    non_official = []
+    if recipe is not None:
+        sources = recipe.get("field_sources", {})
+        if not isinstance(sources, dict): raise SystemExit("field_sources must be an object")
+        fields = [*(f"sampling.{k}" for k in sampling), *(f"chat_kwargs.{k}" for k in chat_kwargs), "max_tokens", "preserve_reasoning"]
+        non_official = sorted(k for k in fields if sources.get(k) != "official" or (k in ("max_tokens", "preserve_reasoning") and k not in recipe))
+    overrides = {}
+    for field, target in (("sampling", sampling), ("chat_kwargs", chat_kwargs)):
+        value = getattr(a, field)
+        if value is None: continue
+        try: value = json.loads(value)
+        except ValueError: raise SystemExit(f"--{field.replace('_', '-')} requires a JSON object")
+        if not isinstance(value, dict): raise SystemExit(f"--{field.replace('_', '-')} requires a JSON object")
+        overrides[field] = value; target.update(value)
+    if a.max_tokens is not None: max_tokens = overrides["max_tokens"] = a.max_tokens
+    if a.system is not None: system = overrides["system"] = a.system
+    if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
+        raise SystemExit("max_tokens must be a positive integer")
+    if system is not None and not isinstance(system, str): raise SystemExit("system must be text or null")
+    for key in ("temperature", "top_p"):
+        value = sampling.get(key)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+            raise SystemExit(f"sampling.{key} must be a finite number")
+    if set(sampling) & {"model", "messages", "tools", "tool_choice", "max_tokens", "chat_template_kwargs", "system"}:
+        raise SystemExit("sampling contains a reserved request field; use the dedicated recipe field")
+    arm = "harness-uniform" if uniform else "vendor-informed" if non_official else "vendor"
+    if overrides and not uniform: arm += "-overridden"
+    config = {"sampling": sampling, "chat_template_kwargs": chat_kwargs, "max_tokens": max_tokens, "system": system,
+              "preserve_reasoning": preserve, "recipe_arm": arm, "recipe_reason": reason, "recipe": recipe,
+              "recipe_non_official": non_official, "recipe_overrides": overrides,
+              "limitations": recipe["limitations"] if recipe is not None else [], "timeout_scale": max(1, max_tokens / 8000),
+              "max_tokens_explicit": (recipe is not None and "max_tokens" in recipe) or a.max_tokens is not None}
+    for name in ("EVALBANK_SAMPLING", "EVALBANK_CHAT_KWARGS", "EVALBANK_SYSTEM", "EVALBANK_PRESERVE_REASONING"):
+        os.environ.pop(name, None)
+    if recipe is not None or "sampling" in overrides: os.environ["EVALBANK_SAMPLING"] = json.dumps(sampling)
+    if recipe is not None or "chat_kwargs" in overrides: os.environ["EVALBANK_CHAT_KWARGS"] = json.dumps(chat_kwargs)
+    if system is not None: os.environ["EVALBANK_SYSTEM"] = system
+    if preserve: os.environ["EVALBANK_PRESERVE_REASONING"] = "1"
+    os.environ["EVALBANK_MAX_TOKENS"] = str(max_tokens)
+    return config
+
+
+def ctk(thinking):
+    return CONFIG.get("chat_template_kwargs", {"thinking": thinking, **({"reasoning_effort": "high"} if thinking else {})})
+
+
+def grader_env():
+    versions = {"python": platform.python_version()}
+    for key, cmd in (("tool_eval_bench", ["tool-eval-bench", "--version"]), ("pytest", [sys.executable, "-m", "pytest", "--version"])):
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=True)
+            versions[key] = (p.stdout or p.stderr).strip()
+        except Exception as e:
+            versions[key] = f"?({type(e).__name__})"
+    return versions
 
 
 def chat(base, model, messages, thinking, max_tokens=None, temperature=None, timeout=600):
-    body = {"model": model, "messages": messages, "max_tokens": max_tokens or MAX_TOKENS,
-            "temperature": (0.5 if thinking else 0.0) if temperature is None else temperature, "top_p": 0.95,
-            "chat_template_kwargs": {"thinking": thinking, **({"reasoning_effort": "high"} if thinking else {})}}
-    req = urllib.request.Request(f"{base}/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"})
+    sampling = dict(CONFIG.get("sampling", {"temperature": 0.5 if thinking else 0.0, "top_p": 0.95}))
+    if temperature is not None: sampling["temperature"] = temperature
+    if CONFIG.get("system") is not None: messages = [{"role": "system", "content": CONFIG["system"]}, *messages]
+    body = {**sampling, "model": model, "messages": messages, "max_tokens": max_tokens or CONFIG.get("max_tokens", MAX_TOKENS),
+            "chat_template_kwargs": ctk(thinking)}
+    headers = {"Content-Type": "application/json"}
+    if os.environ.get("EVALBANK_API_KEY"): headers["Authorization"] = f"Bearer {os.environ['EVALBANK_API_KEY']}"
+    req = urllib.request.Request(f"{base}/chat/completions", json.dumps(body).encode(), headers)
     t0 = time.time()
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with urllib.request.urlopen(req, timeout=timeout * CONFIG.get("timeout_scale", 1)) as r:
         raw = r.read().decode()
     d = json.loads(raw)
     return d["choices"][0]["message"].get("content") or "", raw, round(time.time() - t0, 2), d["choices"][0].get("finish_reason")
@@ -216,7 +309,8 @@ GRADERS = {"set": grade_set, "numeric": grade_numeric, "contains": grade_contain
 
 # ---------- judge (anti-family, pass/fail + critique) ----------
 def judge(item, out, judge_model, gw=None):
-    gw = gw or os.environ.get("EVALBANK_JUDGE_BASE_URL") or "http://127.0.0.1:8000/v1"
+    gw = gw or os.environ.get("EVALBANK_JUDGE_BASE_URL")
+    if not gw: raise ValueError("judge endpoint is required")
     key = os.environ.get("EVALBANK_JUDGE_API_KEY") or ""
     rubric = item["judge"]["rubric"]
     prompt = ("You are grading a model answer. Rubric:\n" + rubric + "\n\nQuestion:\n" + item["prompt"][:4000] +
@@ -235,7 +329,7 @@ def judge(item, out, judge_model, gw=None):
 def run_item(item, base, model, thinking, judge_model, judge_base=None):
     if item["expected"]["type"] == "agent":
         sys.path.insert(0, f"{ROOT}/tools"); import agent_loop
-        r = agent_loop.run_task(f"{ROOT}/bank/{TIER}/c9-long-coding/{item['expected']['task_dir']}", base, model, thinking, timeout=item.get("timeout", 900))
+        r = agent_loop.run_task(f"{ROOT}/bank/{TIER}/c9-long-coding/{item['expected']['task_dir']}", base, model, thinking, timeout=item.get("timeout", 900) * CONFIG.get("timeout_scale", 1))
         raws = r.pop("raw_http_bodies"); detail = {k: r[k] for k in ("hidden_passed", "hidden_total", "turns", "tool_calls", "finished", "tail")}
         return {"id": item["id"], "cat": item["cat"], "score": r["score"], "secs": r["secs"], "usage": r["usage"], "error": r["error"], "detail": detail, "raw_http_body": json.dumps(raws)}
     msgs = []
@@ -261,6 +355,8 @@ def run_item(item, base, model, thinking, judge_model, judge_base=None):
             score, detail = 0.0, {"judge_err": str(e)[:120]}
     else:
         score, detail = 0.0, {"err": f"no grader for {t}"}
+    if fin == "length" and score > 0:
+        detail = {"truncated_credit_revoked": score, "grader_detail": detail}; score = 0.0
     rec.update({"score": score, "secs": secs, "finish": fin, "usage": usage_of(raw), "detail": detail, "answer": ans[:2000], "raw_http_body": raw})
     return rec
 
@@ -276,14 +372,24 @@ def run_cat(cat, items, base, model, thinking, judge_model, parallel, rawdir, k,
     return 100.0 * sum(r["score"] for r in recs) / max(1, len(recs)), len(recs), (f"tok={tok} wall={round(secs)}s" if not any(r.get("error") for r in recs) else f"errors={sum(1 for r in recs if r.get('error'))} tok={tok}")
 
 
-def run_pack(cat, base, model, thinking, rawdir, k, tier):
+def run_pack(cat, base, model, thinking, rawdir, k, tier, parallel=4):
     packdir = f"{ROOT}/bank/{tier}/{cat}"
     out = f"{rawdir}/{cat}-run{k}.json"
-    kw = {"chat_template_kwargs": {"thinking": thinking, **({"reasoning_effort": "high"} if thinking else {})}}
+    kw = {**CONFIG.get("sampling", {"temperature": 0.5 if thinking else 0.0, "top_p": 0.95}), "chat_template_kwargs": ctk(thinking)}
+    if CONFIG.get("max_tokens_explicit"): kw["max_tokens"] = CONFIG["max_tokens"]
+    if CONFIG.get("system") is not None: kw["system"] = CONFIG["system"]
+    scale = CONFIG.get("timeout_scale", 1)
     cmd = ["tool-eval-bench", "--base-url", base.rsplit("/v1", 1)[0], "--model", model, "--scenario-pack", packdir, "--pack-only",
-           "--seed", "42", "--trials", "1", "--parallel", "4", "--timeout", "360", "--max-turns", "16", "--no-live", "--no-warmup",
-           "--json-file", out, "--backend-kwargs", json.dumps({**kw, "temperature": 0.5 if thinking else 0.0, "top_p": 0.95})]
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+           "--seed", "42", "--trials", "1", "--parallel", str(parallel), "--timeout", str(math.ceil(360 * scale)), "--max-turns", "16", "--no-live", "--no-warmup",
+           "--json-file", out, "--backend-kwargs", json.dumps(kw)]
+    if os.environ.get("EVALBANK_API_KEY"): cmd += ["--api-key", os.environ["EVALBANK_API_KEY"]]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=3600 * scale)
+    except subprocess.TimeoutExpired:
+        return None, 0, f"pack timeout after {3600 * scale:g}s"
+    except OSError as e:
+        return None, 0, f"pack failed: {type(e).__name__}"
+    if p.returncode: return None, 0, f"rc={p.returncode}: {p.stderr[-400:]}"
     try:
         d = json.load(open(out))
     except Exception:
@@ -304,7 +410,11 @@ def main():
     ap.add_argument("--runs", type=int, default=2, help="2 or more; a single run has no spread and is not comparable"); ap.add_argument("--thinking", default="on", choices=["on", "off"])
     ap.add_argument("--parallel", type=int, default=4); ap.add_argument("--judge", default="")
     ap.add_argument("--judge-base-url", default=None, help="OpenAI-compatible endpoint for the cross-family judge (default: EVALBANK_JUDGE_BASE_URL env, else --base-url)")
+    ap.add_argument("--recipe-arm", choices=["vendor", "harness-uniform"], default="vendor"); ap.add_argument("--reason", default="")
+    ap.add_argument("--max-tokens", type=int); ap.add_argument("--sampling"); ap.add_argument("--chat-kwargs"); ap.add_argument("--system")
     a = ap.parse_args()
+    global CONFIG; CONFIG = resolve_config(a)
+    if a.runs < 1 or a.parallel < 1: ap.error("--runs and --parallel must be positive")
     global TIER; TIER = a.tier
     if a.tier == "private": assert_local(a.base_url)
     judge_base = a.judge_base_url or os.environ.get("EVALBANK_JUDGE_BASE_URL") or a.base_url
@@ -321,7 +431,7 @@ def main():
         for cat in cats:
             t0 = time.time()
             if cat in PACK_CATS:
-                score, n, err = run_pack(cat, a.base_url, a.model, thinking, rawdir, k, a.tier)
+                score, n, err = run_pack(cat, a.base_url, a.model, thinking, rawdir, k, a.tier, parallel=a.parallel)
             else:
                 items = load_items(a.tier, cat)
                 if not items: score, n, err = None, 0, "no items"
@@ -339,17 +449,21 @@ def main():
     own = [r["median"] for r in rows if r["kind"].startswith("own") and r["median"] is not None]
     pack = [r["median"] for r in rows if r["kind"].startswith("pack") and r["median"] is not None]
     res = {"label": a.label, "model": a.model, "base_url": a.base_url, "tier": a.tier, "thinking": thinking, "runs": a.runs,
-           "bank_hash": bh, "grader_version": gv, "cats": cats, "ts": ts, "rows": rows,
+           "bank_hash": bh, "grader_version": gv, "grader_env": grader_env(), **CONFIG, "cats": cats, "ts": ts, "rows": rows,
            "own_mean": round(statistics.mean(own), 1) if own else None, "pack_mean": round(statistics.mean(pack), 1) if pack else None}
     json.dump(res, open(f"{outdir}/results.json", "w"), ensure_ascii=False, indent=1)
     md = [f"# evalbank {a.label} · {a.model} · thinking={'on' if thinking else 'off'} · bank_hash={bh} · grader={gv} · runs={a.runs}", "",
+          f"Recipe arm: **{CONFIG['recipe_arm']}**" + (" (control arm)" if CONFIG['recipe_arm'] == "harness-uniform" else " (source labels are not independently verified)"),
+          f"Reason: {CONFIG['recipe_reason']}", f"Non-official fields: {json.dumps(CONFIG['recipe_non_official'])}",
+          f"Overrides: {json.dumps(CONFIG['recipe_overrides'])}", f"Limitations: {json.dumps(CONFIG['limitations'])}", "",
           "| cat | kind | runs | median | spread | |", "|---|---|---|---|---|---|"]
     for r in rows:
         md.append(f"| {r['cat']} | {r['kind']} | {r['runs']} | {r['median']} | {r['spread']} | {r['flag']} |")
     md += ["", f"own(0/1) mean: **{res['own_mean']}** · pack(0/1/2) mean: **{res['pack_mean']}** (pack scores are reported separately, never merged with own-bank scores; ⚠ = spread > 5, runs not comparable)",
            "", "Significance: for a category with n=30 items, one item is 3.3 points; a within-category gap below 10 points between two models should be treated as noise. Discriminative range: any category scoring >=95 or <=5 needs harder or replacement items.",
-           f"Sampling: thinking={'on t=0.5 top_p=0.95 effort=high' if thinking else 'off t=0'}; pack scoring is strict positional matching (a single extra exploratory tool call scores 0), so tool errors are never injected."]
+           f"Recipe arm: {CONFIG['recipe_arm']}; requested sampling: {json.dumps(CONFIG['sampling'])}; chat_template_kwargs: {json.dumps(ctk(thinking))}; max_tokens: {CONFIG['max_tokens']}; system: {json.dumps(CONFIG['system'])}; preserve_reasoning: {CONFIG['preserve_reasoning']}; timeout_scale: {CONFIG['timeout_scale']}. Pack max_tokens: {'explicit' if CONFIG['max_tokens_explicit'] else 'tool default'}. Pack scoring is strict positional matching (a single extra exploratory tool call scores 0), so tool errors are never injected."]
     open(f"{outdir}/report.md", "w").write("\n".join(md)); print("\n".join(md)); print("saved", outdir)
+    if any("run-failed" in r["flag"] for r in rows): raise SystemExit(1)
 
 
 if __name__ == "__main__":

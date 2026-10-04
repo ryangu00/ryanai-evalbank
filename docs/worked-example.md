@@ -6,7 +6,7 @@ This page is a worked example of the method in [README.md](../README.md) and [me
 
 ## Setup
 
-Five endpoints, same bank, thinking off, temperature 0, two runs each, parallel 4. Hardware: two Dell Pro Max with GB10 nodes (head node + worker node, TP2 over RoCE). The incumbent is the production model. Scores are per-category medians of two runs; ⚠ marks spread > 5 (adjudication uses the lower run). Pack categories use tool-eval-bench scenario packs (0/1/2 points) and are never merged with the own (0/1) categories. The long-context 200K stack is N/A for models whose native context is below 200K, so the 20-item (32K/95K) subset is also reported.
+Five endpoints, same bank, thinking off, temperature 0, two runs each, parallel 4. These runs predate the recipe gate: every endpoint ran under the harness-uniform recipe, which in our own terminology is a control arm, not a per-model vendor recipe. Hardware: two Dell Pro Max with GB10 nodes (head node + worker node, TP2 over RoCE). The incumbent is the production model. Scores are per-category medians of two runs; ⚠ marks spread > 5 (adjudication uses the lower run). Pack categories use tool-eval-bench scenario packs (0/1/2 points) and are never merged with the own (0/1) categories. The long-context 200K stack is N/A for models whose native context is below 200K, so the 20-item (32K/95K) subset is also reported.
 
 ## Per-category medians (two runs; ⚠ = spread > 5, adjudication uses the lower run)
 
@@ -152,7 +152,9 @@ Under the revised rule set the gates are derived from the baseline: critical cat
 
 **Verdict: negative result (keep the incumbent): only c7-agentic-if failed.**
 
-### Thinking settings (both models thinking on, official thinking sampling, max_tokens 16384)
+### Thinking settings (both models thinking on, max_tokens 16384)
+
+These runs used the sampling values we believed to be the vendors' thinking settings (temperature 1.0 and top_p 0.95 for both models, plus top_k 20 and related penalties for the Qwen model), supplied through a sampling override that the published runner at the time did not offer. The values were not independently verified when this table was produced. When we later verified recipes against vendor sources, top_p 0.95 applied to every category turned out not to match one of the two vendors' guidance, which distinguishes agent/tool scenarios from other scenarios. Treat this table as a control-arm comparison. The 2026-10 runner now supports explicit, recorded sampling overrides.
 
 | cat | incumbent | candidate | runs (candidate) | gate | ok |
 |---|---|---|---|---|---|

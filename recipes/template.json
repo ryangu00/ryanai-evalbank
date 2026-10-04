@@ -1,0 +1,15 @@
+{
+  "sampling": {"temperature": null, "top_p": null},
+  "chat_kwargs": {},
+  "max_tokens": null,
+  "system": null,
+  "preserve_reasoning": null,
+  "limitations": [],
+  "sources": [],
+  "field_sources": {
+    "sampling.temperature": "inferred",
+    "sampling.top_p": "inferred",
+    "max_tokens": "inferred",
+    "preserve_reasoning": "inferred"
+  }
+}

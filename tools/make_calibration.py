@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build the human calibration set (grader-vs-human agreement): stratified random sample (fixed
 seed, >=4 per category) of items, paired with the model answer from a run's raw output and the
-grader verdict. Ryan fills `human_pass`.
+grader verdict. A reviewer fills `human_pass`.
   make_calibration.py --run runs/<dir> [--per-cat 4] [--seed 42]
 Writes calibration/<ts>.jsonl (machine) + calibration/<ts>.md (form). agreement.py computes grader-vs-human.
 """
